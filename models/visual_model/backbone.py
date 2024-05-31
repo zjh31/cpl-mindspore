@@ -1,0 +1,124 @@
+# Copyright (c) Facebook, Inc. and its affiliates. All Rights Reserved
+"""
+Backbone modules.
+"""
+from collections import OrderedDict
+
+#import torch
+#import torch.nn.functional as F
+#import torchvision
+#from torch import nn
+from torchvision.models._utils import IntermediateLayerGetter
+from typing import Dict, List
+
+from utils.misc import NestedTensor, is_main_process
+
+from .position_encoding import build_position_encoding
+import mindspore.nn as nn
+import mindspore.ops as ops
+import mindcv
+import mindspore as ms
+import pdb
+import numpy as np
+from mindspore import Tensor
+from mindspore import ParameterTuple, Parameter
+class FrozenBatchNorm2d(nn.Cell):
+    """
+    BatchNorm2d where the batch statistics and the affine parameters are fixed.
+
+    Copy-paste from torchvision.misc.ops with added eps before rqsrt,
+    without which any other models than torchvision.models.resnet[18,34,50,101]
+    produce nans.
+    """
+
+    def __init__(self, n):
+        super(FrozenBatchNorm2d, self).__init__()
+        self.weight = Parameter(Tensor(np.ones(n), dtype=ms.float32), requires_grad=False)
+
+        self.bias = Parameter(Tensor(np.zeros(n), dtype=ms.float32), requires_grad=False)
+        self.running_var = Parameter(Tensor(np.ones(n), dtype=ms.float32), requires_grad=False)
+        self.running_mean = Parameter(Tensor(np.zeros(n), dtype=ms.float32), requires_grad=False)
+
+    def _load_from_state_dict(self, state_dict, prefix, local_metadata, strict,
+                              missing_keys, unexpected_keys, error_msgs):
+        num_batches_tracked_key = prefix + 'num_batches_tracked'
+        if num_batches_tracked_key in state_dict:
+            del state_dict[num_batches_tracked_key]
+
+        super(FrozenBatchNorm2d, self)._load_from_state_dict(
+            state_dict, prefix, local_metadata, strict,
+            missing_keys, unexpected_keys, error_msgs)
+
+    def construct(self, x):
+        # move reshapes to the beginning
+        # to make it fuser-friendly
+        w = self.weight.reshape(1, -1, 1, 1)
+        b = self.bias.reshape(1, -1, 1, 1)
+        rv = self.running_var.reshape(1, -1, 1, 1)
+        rm = self.running_mean.reshape(1, -1, 1, 1)
+        eps = 1e-5
+        scale = w * (rv + eps).rsqrt()
+        bias = b - rm * scale
+        return x * scale + bias
+
+
+class BackboneBase(nn.Cell):
+
+    def __init__(self, name:str, backbone: nn.Cell, num_channels: int, return_interm_layers: bool):
+        super().__init__()
+        '''for name, parameter in backbone.named_parameters():
+            if 'layer2' not in name and 'layer3' not in name and 'layer4' not in name:
+                parameter.requires_grad_(False)'''
+        if return_interm_layers:
+            return_layers = {"layer1": "0", "layer2": "1", "layer3": "2", "layer4": "3"}
+        else:
+            return_layers = {'layer4': "0"}
+        self.body = backbone
+        self.num_channels = num_channels
+
+    def construct(self, tensor_list: NestedTensor):
+        xs = self.body(tensor_list.tensors)
+        out: Dict[str, NestedTensor] = {}
+        m = tensor_list.mask
+        assert m is not None
+        mask = ops.interpolate(m[None].float(), size=xs.shape[-2:]).bool()[0]
+        out['layer4'] = NestedTensor(xs, mask)
+        return out
+
+
+class Backbone(BackboneBase):
+    """ResNet backbone with frozen BatchNorm."""
+    def __init__(self, name: str,
+                 return_interm_layers: bool,
+                 dilation: bool):
+
+        backbone = mindcv.create_model(name, pretrained=True, norm=FrozenBatchNorm2d)
+        assert name in ('resnet50', 'resnet101')
+        num_channels = 2048
+        super().__init__(name, backbone, num_channels, return_interm_layers)
+
+
+class Joiner(nn.SequentialCell):
+    def __init__(self, backbone, position_embedding):
+        super().__init__(backbone, position_embedding)
+
+    def construct(self, tensor_list: NestedTensor):
+        xs = self[0](tensor_list)
+        out: List[NestedTensor] = []
+        pos = []
+        for name, x in xs.items():
+            out.append(x)
+            # position encoding
+            pos.append(self[1](x).to(x.tensors.dtype))
+
+        return out, pos
+
+
+def build_backbone(args):
+    position_embedding = build_position_encoding(args)
+    # train_backbone = args.lr_detr > 0
+    return_interm_layers = False
+    backbone = Backbone(args.backbone, return_interm_layers, args.dilation)
+    model = Joiner(backbone, position_embedding)
+    model.num_channels = backbone.num_channels
+    return model
